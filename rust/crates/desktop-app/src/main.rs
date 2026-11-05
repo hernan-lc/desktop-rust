@@ -1,0 +1,301 @@
+//! # github-desktop-rs
+//!
+//! The application shell. Built directly on `tao` (event loop, window, native
+//! menu) and `wry` (WebView2 / WKWebView / WebKitGTK). No Tauri, no Electron,
+//! no Node runtime, and no TypeScript in the backend: everything below the web
+//! layer lives in the GUI-free `desktop-core` crate.
+//!
+//! ```text
+//!  web (desktop://)  <--evaluate_script--  main-process events
+//!        |                                      ^
+//!        | window.ipc.postMessage               | Host::emit
+//!        v                                      |
+//!   Bridge (worker thread) ---> DesktopApp ---> state dispatcher
+//!                                   |
+//!                                   +--> Host::window --> tao UI thread
+//! ```
+
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod actions;
+mod bridge;
+mod host;
+mod menu;
+
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+use tao::{
+    event::{Event, StartCause, WindowEvent},
+    event_loop::{ControlFlow, EventLoopBuilder},
+    window::{Theme, WindowBuilder},
+};
+use wry::WebViewBuilder;
+
+use desktop_core::app::DesktopApp;
+use desktop_core::ipc::channels::event;
+
+use crate::actions::ActionEffect;
+use crate::bridge::{js_literal, Bridge, INIT_SCRIPT};
+use crate::host::{AppEvent, TaoHost, WindowInfo};
+
+const APP_URL: &str = "desktop://localhost/index.html";
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("github-desktop-rs: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("github-desktop-rs {} (tao + wry, no Tauri)", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--self-test" || a == "--no-window") {
+        return self_test();
+    }
+
+    // -- tao event loop -----------------------------------------------------
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
+    let proxy = event_loop.create_proxy();
+    let info = Arc::new(Mutex::new(WindowInfo {
+        dark: desktop_core::platform::should_use_dark_colors(),
+        ..WindowInfo::default()
+    }));
+    let host = TaoHost::new(proxy.clone(), info.clone());
+    let app = DesktopApp::new(host.clone())?;
+
+    let window = WindowBuilder::new()
+        .with_title("GitHub Desktop (Rust)")
+        .with_inner_size(tao::dpi::LogicalSize::new(1280.0, 820.0))
+        .with_min_inner_size(tao::dpi::LogicalSize::new(880.0, 600.0))
+        .with_visible(true)
+        .build(&event_loop)?;
+
+    // -- native menu --------------------------------------------------------
+    let native_menu = menu::install(proxy.clone());
+    if let Some(menu) = &native_menu {
+        menu::attach(menu, &window);
+    }
+
+    // -- webview + bridge ---------------------------------------------------
+    let bridge = Bridge::new(app.clone(), proxy.clone(), host.clone());
+    let builder = WebViewBuilder::new()
+        .with_asynchronous_custom_protocol("desktop".into(), {
+            let bridge = bridge.clone();
+            move |_id, request, responder| bridge.handle_protocol(request, responder)
+        })
+        .with_ipc_handler({
+            let bridge = bridge.clone();
+            move |request| bridge.handle_ipc(request.body())
+        })
+        .with_initialization_script(INIT_SCRIPT)
+        .with_navigation_handler(|url| {
+            url.starts_with("desktop://")
+                || url.starts_with("http://desktop.")
+                || url.starts_with("https://desktop.")
+                || url.starts_with("about:")
+        })
+        .with_devtools(true)
+        .with_url(APP_URL);
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "ios", target_os = "android"))]
+    let webview = builder.build(&window)?;
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios", target_os = "android")))]
+    let webview = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+        let vbox = window
+            .default_vbox()
+            .ok_or("tao window has no default GTK vbox")?;
+        builder.build_gtk(vbox)?
+    };
+
+    // Initial state / launch actions are queued in the host outbox and flushed
+    // as user events once the loop starts, so nothing is lost to load timing.
+    app.broadcast_initial_state();
+    app.handle_launch_args(&args);
+
+    tracing::info!(url = APP_URL, "webview ready; entering tao event loop");
+
+    let app_loop = app.clone();
+    let host_loop = host.clone();
+    let info_loop = info.clone();
+    let _menu_keepalive = native_menu;
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+
+        match event {
+            Event::UserEvent(user) => match user {
+                AppEvent::Flush => {
+                    let pending = host_loop.drain();
+                    if pending.is_empty() {
+                        return;
+                    }
+                    let mut failed = Vec::new();
+                    for (channel, args) in pending {
+                        let script = format!(
+                            "window.__desktop && window.__desktop.emit({},{})",
+                            js_literal(&json!(channel)),
+                            js_literal(&args)
+                        );
+                        if webview.evaluate_script(&script).is_err() {
+                            failed.push((channel, args));
+                        }
+                    }
+                    host_loop.requeue(failed);
+                }
+                AppEvent::RpcResult { id, result } => {
+                    let payload = serde_json::to_value(&result)
+                        .unwrap_or_else(|_| json!({ "ok": false }));
+                    let script = format!(
+                        "window.__desktop && window.__desktop.resolve({},{})",
+                        id,
+                        js_literal(&payload)
+                    );
+                    if let Err(error) = webview.evaluate_script(&script) {
+                        tracing::warn!(%error, id, "failed to resolve renderer invoke");
+                    }
+                }
+                AppEvent::WindowAction { action, reply } => {
+                    let (value, effect) =
+                        actions::apply(action, &window, &webview, &info_loop, &app_loop);
+                    if let Some(reply) = reply {
+                        let _ = reply.send(Ok(value));
+                    }
+                    if matches!(effect, ActionEffect::Exit) {
+                        host_loop.shutdown();
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+                AppEvent::NativeMenu(id) => {
+                    if id == "quit-app" {
+                        host_loop.shutdown();
+                        *control_flow = ControlFlow::Exit;
+                    } else {
+                        app_loop.emit(event::MENU_EVENT, vec![json!(id)]);
+                    }
+                }
+            },
+
+            Event::NewEvents(StartCause::Init) => {
+                window.set_focus();
+            }
+
+            Event::WindowEvent { event: window_event, .. } => match window_event {
+                WindowEvent::CloseRequested => {
+                    // Electron's AppWindow emitted `will-quit` first. Keep that
+                    // contract so a renderer can veto / persist on shutdown.
+                    app_loop.emit("will-quit", vec![]);
+                    host_loop.shutdown();
+                    *control_flow = ControlFlow::Exit;
+                }
+                WindowEvent::Focused(focused) => {
+                    info_loop.lock().unwrap_or_else(|e| e.into_inner()).focused = focused;
+                    app_loop.emit(if focused { event::FOCUS } else { event::BLUR }, vec![]);
+                }
+                WindowEvent::Resized(_) => {
+                    let maximized = window.is_maximized();
+                    let mut guard = info_loop.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.maximized != maximized {
+                        guard.maximized = maximized;
+                        guard.window_state = if maximized {
+                            desktop_core::models::WindowState::Maximized
+                        } else {
+                            desktop_core::models::WindowState::Normal
+                        };
+                        drop(guard);
+                        app_loop.emit(
+                            event::WINDOW_STATE_CHANGED,
+                            vec![json!(if maximized { "maximized" } else { "normal" })],
+                        );
+                    }
+                }
+                WindowEvent::ThemeChanged(theme) => {
+                    let dark = matches!(theme, Theme::Dark);
+                    info_loop.lock().unwrap_or_else(|e| e.into_inner()).dark = dark;
+                    app_loop.emit(event::NATIVE_THEME_UPDATED, vec![json!(dark)]);
+                }
+                _ => {}
+            },
+
+            _ => {}
+        }
+    });
+}
+
+fn print_help() {
+    println!(
+        "github-desktop-rs {} — GitHub Desktop on tao + wry (no Tauri, no Electron)\n\n\
+         Options:\n  \
+         --version            print the version\n  \
+         --help               print this help\n  \
+         --self-test          run headless IPC/domain smoke tests and exit\n  \
+         --cli-open=<path>    open a local repository on launch\n  \
+         --cli-clone=<url>    clone a URL on launch\n\n\
+         Any x-github-client:// or github-mac:// argument is forwarded as a\n\
+         url-action event to the web layer.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Headless smoke test used by CI and by `--self-test`. Exercises the full
+/// invoke path with a `NullHost`, so no window or webview is required.
+fn self_test() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use desktop_core::ipc::protocol::NullHost;
+
+    let app = DesktopApp::new(Arc::new(NullHost))?;
+    let cases: &[(&str, Vec<Value>)] = &[
+        ("desktop.get-app-info", vec![]),
+        ("desktop.get-state", vec![]),
+        ("get-app-path", vec![]),
+        ("get-app-architecture", vec![]),
+        ("get-current-window-state", vec![]),
+        ("is-window-maximized", vec![]),
+        ("get-guid", vec![]),
+        ("get-notifications-permission", vec![]),
+        ("desktop.get-preference", vec![json!({ "key": "tabSize" })]),
+    ];
+
+    for (channel, args) in cases {
+        match app.invoke(channel, args.clone()) {
+            Ok(value) => println!("ok   {channel:<34} {}", compact(&value)),
+            Err(error) => {
+                println!("FAIL {channel:<34} {error}");
+                return Err(format!("self-test failed on {channel}: {error}").into());
+            }
+        }
+    }
+
+    app.send("renderer-ready", vec![json!(0.0)])?;
+    app.send("log", vec![json!("info"), json!("self-test complete")])?;
+    println!("\nself-test: all {} channels answered", cases.len());
+    Ok(())
+}
+
+fn compact(value: &Value) -> String {
+    let text = value.to_string();
+    if text.chars().count() > 96 {
+        format!("{}…", text.chars().take(96).collect::<String>())
+    } else {
+        text
+    }
+}

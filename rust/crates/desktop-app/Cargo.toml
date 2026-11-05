@@ -1,0 +1,26 @@
+[package]
+name = "desktop-app"
+description = "GitHub Desktop application shell built directly on tao + wry (no Tauri, no Electron)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "github-desktop-rs"
+path = "src/main.rs"
+
+[dependencies]
+desktop-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+http.workspace = true
+tao.workspace = true
+wry.workspace = true
+muda.workspace = true
+rfd.workspace = true
+arboard.workspace = true

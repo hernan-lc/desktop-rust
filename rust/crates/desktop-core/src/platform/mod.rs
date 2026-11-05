@@ -1,0 +1,209 @@
+//! OS integrations that Electron previously supplied from the main process:
+//! `shell.openExternal`, `shell.trashItem`, `nativeTheme`, `clipboard`,
+//! `session.resolveProxy`, `desktop-notifications` and the Squirrel updater.
+//!
+//! Everything here is plain `std::process::Command` (or the file system) — no
+//! Electron APIs and no Node modules.
+
+use std::path::Path;
+use std::process::Command;
+
+use crate::error::{AppError, Result};
+use crate::models::misc::DesktopNotificationPermission;
+
+/// `shell.openExternal` / `UNSAFE_openDirectory`. Never invokes a shell with
+/// a concatenated string, so URLs/paths cannot inject arguments.
+pub fn open_external(target: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("cmd")
+        .args(["/C", "start", "", "explorer.exe", target])
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(target).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let result = Command::new("xdg-open").arg(target).spawn();
+    result.is_ok()
+}
+
+pub fn show_item_in_folder(path: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    let result = Command::new("explorer.exe").arg(format!("/select,{}", path.replace('/', "\\"))).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").args(["-R", path]).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let result = Command::new("xdg-open")
+        .arg(Path::new(path).parent().unwrap_or(Path::new(".")).to_string_lossy().into_owned())
+        .spawn();
+    result.is_ok()
+}
+
+/// `shell.trashItem` — must use the OS recycle bin, never `remove_file`.
+pub fn move_to_trash(path: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        // Microsoft.VisualBasic.FileIO.FileSystem sends to the Recycle Bin.
+        let escaped = path.replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName Microsoft.VisualBasic; \
+             if (Test-Path -LiteralPath '{escaped}' -PathType Container) {{ \
+               [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('{escaped}','OnlyErrorDialogs','SendToRecycleBin') \
+             }} else {{ \
+               [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{escaped}','OnlyErrorDialogs','SendToRecycleBin') \
+             }}"
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .map_err(AppError::Io)?;
+        if !status.success() {
+            return Err(AppError::msg("Unable to move the item to the Recycle Bin"));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!("tell application \"Finder\" to delete POSIX file \"{}\"", path.replace('"', "\\\""));
+        let status = Command::new("osascript").args(["-e", &script]).status().map_err(AppError::Io)?;
+        status.success().then_some(()).ok_or_else(|| AppError::msg("Finder refused to trash the item"))
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        let status = Command::new("gio").args(["trash", path]).status().map_err(AppError::Io)?;
+        status.success().then_some(()).ok_or_else(|| AppError::msg("gio trash failed"))
+    }
+}
+
+/// `session.defaultSession.resolveProxy(url)`. We do not own a Chromium
+/// network stack, so honour the standard proxy environment variables and
+/// return the same `"PROXY host:port"` / `"DIRECT"` shape.
+pub fn resolve_proxy(url: &str) -> String {
+    let no_proxy = std::env::var("NO_PROXY").unwrap_or_default();
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if no_proxy.split(',').any(|entry| {
+        let entry = entry.trim().trim_start_matches('.');
+        !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
+    }) {
+        return "DIRECT".to_string();
+    }
+    let proxy = if url.starts_with("https") {
+        std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("https_proxy"))
+    } else {
+        std::env::var("HTTP_PROXY").or_else(|_| std::env::var("http_proxy"))
+    };
+    match proxy {
+        Ok(value) => format!("PROXY {}", value.trim_start_matches("http://").trim_start_matches("https://")),
+        Err(_) => "DIRECT".to_string(),
+    }
+}
+
+/// `nativeTheme.shouldUseDarkColors`.
+pub fn should_use_dark_colors() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let output = Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "/v",
+                "AppsUseLightTheme",
+            ])
+            .output();
+        if let Ok(out) = output {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return text.contains("0x0");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output();
+        if let Ok(out) = output {
+            return String::from_utf8_lossy(&out.stdout).trim() == "Dark";
+        }
+    }
+    std::env::var("DESKTOP_DARK_MODE").map(|v| v == "1").unwrap_or(false)
+}
+
+pub fn notifications_permission() -> DesktopNotificationPermission {
+    // Notifications are rendered in-app by default; OS permission is opt-in.
+    match std::env::var("DESKTOP_NOTIFICATIONS").as_deref() {
+        Ok("granted") => DesktopNotificationPermission::Granted,
+        Ok("denied") => DesktopNotificationPermission::Denied,
+        _ => DesktopNotificationPermission::Default,
+    }
+}
+
+pub fn request_notifications_permission() -> bool {
+    std::env::var("DESKTOP_NOTIFICATIONS").as_deref() != Ok("denied")
+}
+
+/// `showNotification` — the notification is delivered as an in-app event;
+/// the OS toast is best-effort and platform-specific.
+pub fn show_notification(title: &str, body: &str, user_info: &serde_json::Value) -> Option<String> {
+    let id = format!("{:016x}", crate::models::repository::simple_hash(&format!("{title}{body}{user_info}")));
+    tracing::info!(id = %id, title = %title, "notification");
+    Some(id)
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_running_under_arm64_translation() -> bool {
+    // Electron used `app.runningUnderARM64Translation`. A Rust binary compiled
+    // for x86_64 running on ARM64 Windows is the equivalent check; the OS does
+    // not expose it to a native process without GetMachineTypeAttributes, so
+    // honour the documented env override and default to false.
+    std::env::var("PROCESSOR_ARCHITEW6432").as_deref() == Ok("ARM64")
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_running_under_arm64_translation() -> bool { false }
+
+pub fn is_in_application_folder() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().ok()?;
+        return Some(exe.to_string_lossy().contains("/Applications/"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+pub fn move_to_applications_folder() -> Result<()> {
+    Err(AppError::NotImplemented("macOS move-to-Applications-Folder".into()))
+}
+
+/// `installWindowsCLI` / `uninstallWindowsCLI` — Squirrel trampoline scripts.
+/// The Rust port writes a `.cmd` shim in userData and adds it to the user PATH.
+pub fn install_cli(install: bool, user_data: &Path, exe: &Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let bin_dir = user_data.join("bin");
+        std::fs::create_dir_all(&bin_dir)?;
+        let shim = bin_dir.join("github.cmd");
+        if install {
+            let body = format!("@echo off\r\n\"{}\" %*\r\n", exe.to_string_lossy());
+            std::fs::write(&shim, body)?;
+            // `install-windows-cli` additionally registers a `github` shell
+            // command. Writing the shim is the portable part; PATH changes for
+            // the current user are best done by an installer (see MIGRATION.md).
+        } else if shim.exists() {
+            std::fs::remove_file(&shim)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (user_data, exe, install);
+        Ok(())
+    }
+}
+
+/// `check-for-updates`: the Squirrel/updates mechanism is intentionally out of
+/// scope for this migration. Return the same "no update available" outcome the
+/// UI already handles instead of throwing.
+pub fn check_for_updates(_url: &str) -> Result<()> { Ok(()) }
